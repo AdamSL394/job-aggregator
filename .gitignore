@@ -1,0 +1,12 @@
+config/excluded_companies.json
+config/watchlist_companies.json
+config/notable_startups.json
+.env
+service_account.json
+job_aggregator/profiles_local.py
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.pdf
