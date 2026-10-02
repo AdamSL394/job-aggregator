@@ -1,6 +1,5 @@
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -9,26 +8,42 @@ from job_aggregator.ats_clients.base import NormalizedPosting
 from job_aggregator.profiles import Profile
 from job_aggregator.scoring import score_posting
 
+HAS_DB = bool(os.environ.get("DATABASE_URL"))
+
 
 def test_dedup_roundtrip():
-    with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
-        with get_conn(tmp.name) as conn:
-            assert not has_seen(conn, "acme", "1", "adam")
-            insert_posting(conn, "acme", "1", "adam", "Backend Engineer", "Remote", "http://x.com")
-            assert has_seen(conn, "acme", "1", "adam")
+    if not HAS_DB:
+        print("skip test_dedup_roundtrip: DATABASE_URL not set")
+        return
+    with get_conn() as conn:
+        try:
+            assert not has_seen(conn, "test-fixture", "1", "test-fixture")
+            insert_posting(conn, "test-fixture", "1", "test-fixture", "Backend Engineer", "Remote", "http://x.com")
+            assert has_seen(conn, "test-fixture", "1", "test-fixture")
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM seen_postings WHERE company_slug='test-fixture'")
 
 
 def test_prune_removes_old_rows_only():
-    with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
-        with get_conn(tmp.name) as conn:
-            insert_posting(conn, "acme", "old", "adam", "Old Job", "Remote", "http://x.com")
-            insert_posting(conn, "acme", "new", "adam", "New Job", "Remote", "http://y.com")
-            conn.execute(
-                "UPDATE seen_postings SET first_seen_at = datetime('now', '-60 days') WHERE external_id='old'"
-            )
+    if not HAS_DB:
+        print("skip test_prune_removes_old_rows_only: DATABASE_URL not set")
+        return
+    with get_conn() as conn:
+        try:
+            insert_posting(conn, "test-fixture", "old", "test-fixture", "Old Job", "Remote", "http://x.com")
+            insert_posting(conn, "test-fixture", "new", "test-fixture", "New Job", "Remote", "http://y.com")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE seen_postings SET first_seen_at = NOW() - INTERVAL '60 days' "
+                    "WHERE company_slug='test-fixture' AND external_id='old'"
+                )
             prune_old(conn, days=45)
-            assert not has_seen(conn, "acme", "old", "adam")
-            assert has_seen(conn, "acme", "new", "adam")
+            assert not has_seen(conn, "test-fixture", "old", "test-fixture")
+            assert has_seen(conn, "test-fixture", "new", "test-fixture")
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM seen_postings WHERE company_slug='test-fixture'")
 
 
 def test_scoring_matches_target_title():

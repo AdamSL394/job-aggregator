@@ -9,6 +9,8 @@ durable "what did I already decide about this" record, on top of the DB's
 dedup role.
 """
 
+import os
+
 import gspread
 from gspread.utils import ValidationConditionType
 from google.oauth2.service_account import Credentials
@@ -20,7 +22,11 @@ STATUS_COLUMN_LETTER = "F"  # Title=A, Company=B, Tier=C, Date Added=D, Score=E,
 URL_COLUMN_INDEX = 9         # 1-indexed: last column
 
 
-def get_worksheet(sheet_id: str, worksheet_name: str, creds_path: str = "service_account.json"):
+def get_worksheet(sheet_id: str, worksheet_name: str, creds_path: str | None = None):
+    # local run: "service_account.json" in the project root (Option A).
+    # Lambda: lambda_handler.py writes the creds to /tmp and sets this env
+    # var, since Lambda env vars can't hold a file and only /tmp is writable.
+    creds_path = creds_path or os.environ.get("GOOGLE_SERVICE_ACCOUNT_CREDS_PATH", "service_account.json")
     creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(sheet_id)
