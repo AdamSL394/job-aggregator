@@ -150,6 +150,14 @@ def _flush(conn, worksheets, profiles, pending, profile_id):
             # duplicate the old ordering produced on every such failure.
             print(f"WARNING: DB write failed for {item['slug']} after successful Sheet write: {e}")
 
+    try:
+        conn.commit()  # durably save this batch now, not just at the very end
+                        # of the whole run -- a run can take 20-30+ minutes, and
+                        # without this a crash anywhere loses every DB write made
+                        # so far, not just the current batch
+    except Exception as e:
+        print(f"WARNING: commit failed after flushing {profile_id}: {e}")
+
 
 def run():
     companies = load_companies()
@@ -162,6 +170,7 @@ def run():
         "postings_seen_total": 0, "postings_already_known": 0,
         "postings_keyword_rejected": 0, "postings_llm_scored": 0,
         "postings_llm_failed": 0, "postings_below_min_score": 0,
+        "postings_db_errors": 0,
         "postings_written": 0,
     }
 
@@ -192,7 +201,17 @@ def run():
                 for profile_id, profile in profiles.items():
                     for posting in postings:
                         stats["postings_seen_total"] += 1
-                        if has_seen(conn, slug, posting.external_id, profile_id):
+                        try:
+                            already_known = has_seen(conn, slug, posting.external_id, profile_id)
+                        except Exception as e:
+                            # db.py already retries a dropped connection once --
+                            # if it still failed, skip this posting rather than
+                            # crash the whole run. It'll get a clean dedup check
+                            # next run instead.
+                            stats["postings_db_errors"] += 1
+                            print(f"WARNING: dedup check failed for {slug} / {posting.title}: {e}")
+                            continue
+                        if already_known:
                             stats["postings_already_known"] += 1
                             continue
 
@@ -203,10 +222,14 @@ def run():
                         keyword_score = score_posting(posting, profile)
                         if keyword_score == 0.0:
                             stats["postings_keyword_rejected"] += 1
-                            insert_posting(
-                                conn, slug, posting.external_id, profile_id,
-                                posting.title, posting.location, posting.url, 0.0,
-                            )
+                            try:
+                                insert_posting(
+                                    conn, slug, posting.external_id, profile_id,
+                                    posting.title, posting.location, posting.url, 0.0,
+                                )
+                            except Exception as e:
+                                stats["postings_db_errors"] += 1
+                                print(f"WARNING: DB write failed for {slug} / {posting.title}: {e}")
                             continue
 
                         # real fit judgment: resume + actual posting description
@@ -227,10 +250,14 @@ def run():
 
                         if score < profile.min_score:
                             stats["postings_below_min_score"] += 1
-                            insert_posting(
-                                conn, slug, posting.external_id, profile_id,
-                                posting.title, posting.location, posting.url, score,
-                            )
+                            try:
+                                insert_posting(
+                                    conn, slug, posting.external_id, profile_id,
+                                    posting.title, posting.location, posting.url, score,
+                                )
+                            except Exception as e:
+                                stats["postings_db_errors"] += 1
+                                print(f"WARNING: DB write failed for {slug} / {posting.title}: {e}")
                             continue
 
                         tailored = ""
@@ -268,6 +295,7 @@ def run():
                   f"({stats['postings_llm_failed']} failed)")
             print(f"postings below min_score after LLM scoring: {stats['postings_below_min_score']}")
             print(f"postings written to Sheet: {stats['postings_written']}")
+            print(f"postings skipped after DB error (even after reconnect retry): {stats['postings_db_errors']}")
 
 
 if __name__ == "__main__":
