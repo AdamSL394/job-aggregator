@@ -37,6 +37,7 @@ from .db import (
     get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old,
     get_state, set_state, try_acquire_lock, release_lock,
 )
+from .llm import QuotaExhaustedError
 from .relevance import score_relevance
 from .scoring import score_posting
 from .sheets import get_worksheet, append_postings
@@ -209,7 +210,18 @@ def run():
         "postings_llm_failed": 0, "postings_below_min_score": 0,
         "postings_db_errors": 0,
         "postings_written": 0,
+        "postings_quota_skipped": 0,
     }
+    llm_quota_exhausted = False  # set True the moment Gemini's daily free-tier
+                                  # quota is hit; from then on we skip the LLM
+                                  # step entirely for the rest of THIS invocation
+                                  # instead of calling it, getting 429, and still
+                                  # paying the full LLM_DELAY_SECONDS sleep for a
+                                  # call that is guaranteed to fail again until
+                                  # the quota resets (~24h). Not persisted to
+                                  # run_state -- each new invocation gets a fresh
+                                  # attempt, since the quota window is wall-clock
+                                  # time, not tied to any one invocation.
 
     with get_conn() as conn:
         # Single-flight lock: EventBridge fires every 15 minutes, and one
@@ -311,9 +323,26 @@ def run():
                                 print(f"WARNING: DB write failed for {slug} / {posting.title}: {e}")
                             continue
 
+                        # Quota already confirmed exhausted earlier this
+                        # invocation -- skip straight past the LLM step
+                        # entirely (no call, no sleep). Do NOT mark as seen:
+                        # leave it for a future invocation to actually score
+                        # once the quota window resets.
+                        if llm_quota_exhausted:
+                            stats["postings_quota_skipped"] += 1
+                            continue
+
                         # real fit judgment: resume + actual posting description
                         description = strip_html(posting.description)
-                        score, reasoning = score_relevance(profile.resume_text, posting.title, description)
+                        try:
+                            score, reasoning = score_relevance(profile.resume_text, posting.title, description)
+                        except QuotaExhaustedError:
+                            llm_quota_exhausted = True
+                            stats["postings_quota_skipped"] += 1
+                            print("Gemini free-tier daily quota exhausted -- skipping LLM calls "
+                                  "for the rest of this invocation (un-seen postings will be "
+                                  "retried once the quota resets)")
+                            continue
                         stats["postings_llm_scored"] += 1
                         if reasoning.startswith("relevance scoring failed"):
                             stats["postings_llm_failed"] += 1
@@ -341,10 +370,21 @@ def run():
 
                         tailored = ""
                         if score >= profile.min_tailor_score:
-                            tailored = tailor_bullets(
-                                profile.resume_text, posting.title, description,
-                            ) or ""
-                            time.sleep(LLM_DELAY_SECONDS)
+                            try:
+                                tailored = tailor_bullets(
+                                    profile.resume_text, posting.title, description,
+                                ) or ""
+                                time.sleep(LLM_DELAY_SECONDS)
+                            except QuotaExhaustedError:
+                                # the posting itself already passed relevance
+                                # scoring (score computed above) -- quota ran
+                                # out specifically on the tailoring call. Still
+                                # write the posting through at its real score,
+                                # just without tailored bullets this time;
+                                # nothing about the match itself is in doubt.
+                                llm_quota_exhausted = True
+                                print("Gemini free-tier daily quota exhausted during tailoring -- "
+                                      "skipping LLM calls for the rest of this invocation")
 
                         stats["postings_written"] += 1
                         pending[profile_id].append({
@@ -400,6 +440,7 @@ def run():
             print(f"postings below min_score after LLM scoring: {stats['postings_below_min_score']}")
             print(f"postings written to Sheet: {stats['postings_written']}")
             print(f"postings skipped after DB error (even after reconnect retry): {stats['postings_db_errors']}")
+            print(f"postings skipped after LLM quota exhausted: {stats['postings_quota_skipped']}")
 
             # release last -- only after the cursor/completion state above
             # is durably saved, so whichever invocation picks up next sees

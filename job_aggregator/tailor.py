@@ -7,7 +7,7 @@ relying on this at any real volume, they change. Uses the current
 google-genai SDK (the older google-generativeai package is deprecated).
 """
 
-from .llm import get_client
+from .llm import get_client, is_quota_exhausted, QuotaExhaustedError
 
 
 SYSTEM_PROMPT = """You are reordering and rewording an existing resume's \
@@ -43,6 +43,8 @@ def tailor_bullets(resume_text: str, posting_title: str, posting_description: st
         )
         output = (response.text or "").strip()
     except Exception as e:
+        if is_quota_exhausted(e):
+            raise QuotaExhaustedError(str(e)) from e
         # fail closed, same as relevance.py -- a rate limit or transient API
         # error here should never crash the whole run
         print(f"WARNING: tailoring failed: {e}")

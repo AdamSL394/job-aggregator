@@ -8,7 +8,7 @@ decides whether it's actually a good match.
 import json
 import re
 
-from .llm import get_client
+from .llm import get_client, is_quota_exhausted, QuotaExhaustedError
 
 PROMPT = """You are judging how well a candidate's resume fits a specific \
 job posting. Be strict -- most postings that pass a basic title keyword \
@@ -69,4 +69,9 @@ def score_relevance(resume_text: str, title: str, description: str) -> tuple[flo
         reasoning = str(parsed.get("reasoning", ""))[:300]
         return score, reasoning
     except Exception as e:
+        if is_quota_exhausted(e):
+            # don't fail-closed-and-continue like any other scoring error --
+            # the caller needs to know to stop calling the LLM at all for
+            # the rest of this run, not just this one posting
+            raise QuotaExhaustedError(str(e)) from e
         return 0.0, f"relevance scoring failed: {e}"
