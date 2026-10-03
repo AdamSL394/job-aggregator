@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS seen_postings (
     written_to_sheet INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (company_slug, external_id, profile_id)
 );
+
+-- Simple key/value store for resumable-run state (Lambda's 900s hard
+-- timeout means one pass through the company list takes many
+-- invocations; this is how one invocation tells the next where it
+-- left off, and how we know a given day's full pass is already done).
+CREATE TABLE IF NOT EXISTS run_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -165,6 +174,31 @@ def mark_written_to_sheet(conn, company_slug: str, external_id: str, profile_id:
                 """,
                 (company_slug, external_id, profile_id),
             )
+    _retrying(conn, work)
+
+
+def get_state(conn, key: str) -> str | None:
+    def work():
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM run_state WHERE key=%s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    return _retrying(conn, work)
+
+
+def set_state(conn, key: str, value: str):
+    def work():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO run_state (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                (key, value),
+            )
+        conn.commit()  # commit immediately -- this is our resume point,
+                        # it must survive even if the process is killed
+                        # (e.g. hitting the Lambda timeout) right after this
     _retrying(conn, work)
 
 

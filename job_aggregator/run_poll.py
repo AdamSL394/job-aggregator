@@ -2,6 +2,14 @@
 Entry point. Run this from local cron (Option A):
     0 8 * * * cd /path/to/job-aggregator && python -m job_aggregator.run_poll
 
+Or invoke repeatedly from Lambda (Option B) -- see TIME_BUDGET_SECONDS below:
+each invocation processes as much of today's company list as it can inside
+a bounded time budget, then saves its place in Postgres (run_state table)
+and exits cleanly. The next invocation picks up right where it left off.
+Once a full day's list is done, later invocations that same day exit
+almost instantly instead of re-scanning everything (see the
+run_state / STATE_COMPLETED_DATE handling in run() below).
+
 For each company: fetch postings -> for each profile: dedup check ->
 score -> if new & above threshold, write to that profile's Sheet ->
 if above the (higher) tailor threshold, also tailor resume bullets.
@@ -25,7 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()  # populates os.environ from .env -- must happen before tailor.py reads GEMINI_API_KEY
 
 from .ats_clients import greenhouse, lever, ashby
-from .db import get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old
+from .db import get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old, get_state, set_state
 from .relevance import score_relevance
 from .scoring import score_posting
 from .sheets import get_worksheet, append_postings
@@ -55,6 +63,19 @@ SHARD_SIZE = 400             # discovery-pool companies polled per run.
 FLUSH_EVERY = 40             # rows buffered per profile before a batch Sheet write
                               # (Sheets write quota is 60 requests/min/user by default --
                               # batching keeps us at ~1 request per 40 rows, not per row)
+
+TIME_BUDGET_SECONDS = 700    # Lambda's hard ceiling is 900s (15 min) and cannot be
+                              # raised. 700s leaves ~200s of buffer for cold start,
+                              # final flush, and commit overhead so we exit cleanly
+                              # on our own terms instead of getting hard-killed
+                              # mid-posting with the batch-not-yet-flushed. Only
+                              # relevant to Option B (Lambda); a local cron run
+                              # ignores this and just runs until it reaches the end
+                              # of the list, same as before.
+
+STATE_CURSOR_DATE = "cursor_date"     # run_state key: date (ISO) the saved cursor applies to
+STATE_CURSOR_INDEX = "cursor_index"   # run_state key: index into today's company list to resume at
+STATE_COMPLETED_DATE = "completed_date"  # run_state key: most recent date fully processed
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -160,6 +181,12 @@ def _flush(conn, worksheets, profiles, pending, profile_id):
 
 
 def run():
+    today = date.today().isoformat()
+    start_time = time.monotonic()
+
+    def time_left() -> float:
+        return TIME_BUDGET_SECONDS - (time.monotonic() - start_time)
+
     companies = load_companies()
     profiles = load_profiles()
     worksheets = {}  # profile_id -> gspread worksheet, opened lazily
@@ -177,8 +204,37 @@ def run():
     with get_conn() as conn:
         prune_old(conn)
 
+        # Daily-completion check: today's company list (watchlist + notable +
+        # the date-derived discovery shard) is identical across every
+        # invocation made on the same calendar day. Once one full pass has
+        # completed, later same-day invocations should do ~nothing -- the
+        # mandatory REQUEST_DELAY_SECONDS alone makes a "nothing new" pass
+        # take ~18 minutes for 720 companies, and running that every 15-20
+        # minutes all day for zero benefit is pure wasted compute (and, past
+        # the free tier, pure wasted money).
+        if get_state(conn, STATE_COMPLETED_DATE) == today:
+            print(f"{today} already fully processed -- nothing to do until tomorrow's shard rotates in.")
+            return
+
+        # Resume cursor: where today's previous invocation (if any) left off.
+        # A cursor saved for a different date is stale (yesterday's shard is
+        # a different list) and is ignored -- start over from 0.
+        start_index = 0
+        if get_state(conn, STATE_CURSOR_DATE) == today:
+            saved_index = get_state(conn, STATE_CURSOR_INDEX)
+            if saved_index is not None:
+                start_index = int(saved_index)
+        if start_index:
+            print(f"resuming {today}'s run at company {start_index}/{len(companies)}")
+
+        ran_out_of_time = False
         try:
-            for company in companies:
+            for i in range(start_index, len(companies)):
+                if time_left() <= 0:
+                    ran_out_of_time = True
+                    break
+
+                company = companies[i]
                 slug, ats_name = company["slug"], company["ats"]
                 client = ATS_CLIENTS.get(ats_name)
                 if client is None:
@@ -284,6 +340,31 @@ def run():
             # this is what prevents a mid-run failure from silently losing matches
             for profile_id in profiles:
                 _flush(conn, worksheets, profiles, pending, profile_id)
+
+            if ran_out_of_time:
+                # save our place -- next invocation resumes at company `i`
+                # (not i+1: it may have fetched the board but not finished
+                # scoring every posting/profile for it; re-fetching one
+                # company is cheap, and has_seen() dedup means no posting
+                # gets double-scored or double-written either way)
+                try:
+                    set_state(conn, STATE_CURSOR_DATE, today)
+                    set_state(conn, STATE_CURSOR_INDEX, str(i))
+                    print(f"\ntime budget reached -- saved cursor at company {i}/{len(companies)}, "
+                          f"resuming there next invocation")
+                except Exception as e:
+                    print(f"WARNING: failed to save resume cursor: {e}")
+            else:
+                # reached the end of the list without running out of time --
+                # today's full pass is done. Mark it so later same-day
+                # invocations exit instantly instead of re-scanning, and
+                # clear the cursor so tomorrow's (different) shard starts at 0.
+                try:
+                    set_state(conn, STATE_COMPLETED_DATE, today)
+                    set_state(conn, STATE_CURSOR_INDEX, "0")
+                    print(f"\n{today}'s full company list processed -- marked complete.")
+                except Exception as e:
+                    print(f"WARNING: failed to save completion state: {e}")
 
             print("\n--- run summary ---")
             print(f"companies: {stats['companies_fetched_ok']} fetched ok, "
