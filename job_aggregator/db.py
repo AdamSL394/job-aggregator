@@ -202,6 +202,60 @@ def set_state(conn, key: str, value: str):
     _retrying(conn, work)
 
 
+LOCK_KEY = "lock_expires_at"
+
+
+def try_acquire_lock(conn, ttl_seconds: int) -> bool:
+    """Claim the single-run lock, atomically. Returns True if this call got
+    it, False if another invocation already holds an unexpired lock.
+
+    Deliberately NOT a Postgres advisory lock (pg_advisory_lock) -- those
+    are tied to the current session/backend connection, which breaks under
+    connection-pooling modes that can hand out a different backend
+    connection per statement (exactly the kind of pooling Neon's free tier
+    fronts Postgres with). This uses a single atomic UPDATE/INSERT
+    instead, which only depends on row contents, not which physical
+    connection ran it -- safe under any pooling mode.
+
+    TTL-based rather than released-on-connection-close: if an invocation
+    gets hard-killed (crash, Lambda force-terminating past our own
+    time-budget check) and never calls release_lock(), the lock still
+    self-expires after ttl_seconds instead of deadlocking every future
+    invocation forever.
+    """
+    now = datetime.utcnow()
+    now_iso = now.isoformat()
+    expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
+
+    def work():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO run_state (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                WHERE run_state.value < %s
+                """,
+                (LOCK_KEY, expires_at, now_iso),
+            )
+            acquired = cur.rowcount == 1
+        conn.commit()
+        return acquired
+    return _retrying(conn, work)
+
+
+def release_lock(conn):
+    """Free the lock immediately so the next invocation doesn't have to
+    wait out the TTL. Safe to call even if this invocation never held it."""
+    def work():
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE run_state SET value = %s WHERE key = %s",
+                ("1970-01-01T00:00:00", LOCK_KEY),
+            )
+        conn.commit()
+    _retrying(conn, work)
+
+
 def prune_old(conn, days: int = PRUNE_AFTER_DAYS):
     cutoff = datetime.utcnow() - timedelta(days=days)
     def work():

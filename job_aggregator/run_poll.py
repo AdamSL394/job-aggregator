@@ -33,7 +33,10 @@ from dotenv import load_dotenv
 load_dotenv()  # populates os.environ from .env -- must happen before tailor.py reads GEMINI_API_KEY
 
 from .ats_clients import greenhouse, lever, ashby
-from .db import get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old, get_state, set_state
+from .db import (
+    get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old,
+    get_state, set_state, try_acquire_lock, release_lock,
+)
 from .relevance import score_relevance
 from .scoring import score_posting
 from .sheets import get_worksheet, append_postings
@@ -76,6 +79,13 @@ TIME_BUDGET_SECONDS = 700    # Lambda's hard ceiling is 900s (15 min) and cannot
 STATE_CURSOR_DATE = "cursor_date"     # run_state key: date (ISO) the saved cursor applies to
 STATE_CURSOR_INDEX = "cursor_index"   # run_state key: index into today's company list to resume at
 STATE_COMPLETED_DATE = "completed_date"  # run_state key: most recent date fully processed
+
+LOCK_TTL_SECONDS = 800       # must be longer than TIME_BUDGET_SECONDS + flush/commit
+                              # overhead, or a normally-running invocation could have
+                              # its own lock expire out from under it. Longer than
+                              # TIME_BUDGET_SECONDS on purpose -- this is the ceiling
+                              # for a crashed/hard-killed invocation that never got to
+                              # release its own lock, not the expected run length.
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +212,19 @@ def run():
     }
 
     with get_conn() as conn:
+        # Single-flight lock: EventBridge fires every 15 minutes, and one
+        # invocation's own time budget (700s) is close enough to that
+        # window that a slow invocation could still be running when the
+        # next one starts -- on top of the ordinary risk of a manual test
+        # invoke overlapping a scheduled one. Without this, two concurrent
+        # invocations each read the same starting cursor, and whichever
+        # finishes last overwrites the other's progress. If the lock is
+        # already held, exit immediately and let the next scheduled tick
+        # try again -- no partial work, no state touched.
+        if not try_acquire_lock(conn, LOCK_TTL_SECONDS):
+            print("another invocation is already running (lock held) -- exiting without doing any work")
+            return
+
         prune_old(conn)
 
         # Daily-completion check: today's company list (watchlist + notable +
@@ -377,6 +400,14 @@ def run():
             print(f"postings below min_score after LLM scoring: {stats['postings_below_min_score']}")
             print(f"postings written to Sheet: {stats['postings_written']}")
             print(f"postings skipped after DB error (even after reconnect retry): {stats['postings_db_errors']}")
+
+            # release last -- only after the cursor/completion state above
+            # is durably saved, so whichever invocation picks up next sees
+            # accurate state rather than racing a half-written run
+            try:
+                release_lock(conn)
+            except Exception as e:
+                print(f"WARNING: failed to release run lock (will self-expire in {LOCK_TTL_SECONDS}s): {e}")
 
 
 if __name__ == "__main__":
