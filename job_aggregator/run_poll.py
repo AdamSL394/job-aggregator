@@ -37,6 +37,7 @@ from .db import (
     get_conn, has_seen, insert_posting, save_tailored_bullets, prune_old,
     get_state, set_state, try_acquire_lock, release_lock,
 )
+from .digest import send_daily_digest
 from .llm import QuotaExhaustedError
 from .relevance import score_relevance
 from .scoring import score_posting
@@ -428,6 +429,16 @@ def run():
                     print(f"\n{today}'s full company list processed -- marked complete.")
                 except Exception as e:
                     print(f"WARNING: failed to save completion state: {e}")
+
+                # today's pass just finished -- this branch only runs once per
+                # day (every later same-day invocation exits earlier, at the
+                # STATE_COMPLETED_DATE check), so this is the one point to
+                # send the daily digest email. Failures here never touch
+                # run_state -- completion was already saved above.
+                try:
+                    send_daily_digest(conn, profiles, today)
+                except Exception as e:
+                    print(f"WARNING: digest email step failed: {e}")
 
             print("\n--- run summary ---")
             print(f"companies: {stats['companies_fetched_ok']} fetched ok, "

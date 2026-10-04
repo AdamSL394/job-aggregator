@@ -30,7 +30,10 @@ class Profile:
         "staff", "lead", "principal", "founding",
     ])
     stretch_mode: str = "narrow"  # "narrow" | "broad"
-    min_score: float = 0.6         # write to Sheet above this
+    min_score: float = 0.85         # write to Sheet above this
     min_tailor_score: float = 0.85  # also tailor resume bullets above this
     sheet_id: str = ""             # Google Sheet ID, one per profile
     worksheet_name: str = "New postings"  # tab within that sheet -- won't touch your other tabs
+    digest_email: str = ""         # if set, gets a daily email once the day's pass
+                                    # completes, listing that day's Sheet matches.
+                                    # Leave "" to disable.
