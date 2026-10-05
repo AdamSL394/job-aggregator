@@ -240,8 +240,8 @@ of:
 
 **Email digest (optional, $0).** Set `digest_email` on a profile in
 `profiles_local.py` to get one email a day listing that day's matches
-(whatever got written to that profile's Sheet -- currently gated at
-`profile.min_score = 0.9` in `profiles.py`). It fires once, right after
+(whatever got written to that profile's Sheet -- gated at
+`profile.min_score` in `profiles.py`). It fires once, right after
 the day's full company-list pass completes, not on every 15-minute
 invocation -- see `digest.py` and `ARCHITECTURE.md`. Uses Gmail's SMTP
 over stdlib `smtplib`, no paid email service:

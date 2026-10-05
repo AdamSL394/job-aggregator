@@ -177,25 +177,33 @@ That placement is the whole mechanism: no separate "did we email today"
 flag is needed, because the branch itself only runs once.
 
 It deliberately carries **no threshold of its own** -- it queries
-`seen_postings` for rows `written_to_sheet = 1` with `first_seen_at`
-today, full stop. That set is already exactly "what the Sheet got
-today," gated by `profile.min_score` in `profiles.py` (currently 0.9).
-An earlier version hard-coded a second score cutoff inside `digest.py`;
-that was removed on purpose -- two thresholds that are supposed to
-agree is a bug waiting to happen the next time `min_score` is tuned and
-only one of them gets updated. Now there's one number, in one file, and
-the email and the Sheet can never disagree about what counts as a match.
+`seen_postings` for rows first seen today with
+`relevance_score >= profile.min_score`, the same number that gates the
+Sheet write in `run_poll.py`. A posting is only inserted into
+`seen_postings` after its Sheet write succeeds (or when it's rejected
+below `min_score`), so "scored at or above `min_score`" is exactly "what
+the Sheet got today." There is one number, in `profiles.py`, and the
+email and the Sheet can't disagree about what counts as a match.
 
-Sends over Gmail's SMTP via stdlib `smtplib` -- a Gmail "app password"
-(not the real account password), not a paid transactional email
-service, keeping the project's $0 budget intact. `SMTP_USER`/`SMTP_PASS`
-are Lambda env vars; if they're unset, `send_daily_digest` logs a
-warning and returns instead of raising, same fail-open posture as the
-rest of the run -- a broken email integration should never take down
-the actual scoring/Sheet-writing work. It's also called *after*
-`completed_date` is already durably saved, so a digest failure (bad
-credentials, Gmail rate limit, network blip) can't roll back or block
-anything about the day's run being marked complete.
+Don't filter on `seen_postings.written_to_sheet` instead: `db.py` defines
+`mark_written_to_sheet()`, but nothing ever calls it, so that column is
+always 0. (The first version of the digest did filter on it and silently
+matched nothing -- the log line `no matches written today` is the
+symptom.) The `relevance_score` column is a 4-byte REAL, so the query
+subtracts a small tolerance from `min_score` to keep postings scoring
+exactly at the threshold from being dropped by float rounding.
+
+The message is multipart/alternative: a plain-text part plus a styled HTML
+part (`_render_email`, a pure function that's easy to preview). Sends over
+Gmail's SMTP via stdlib `smtplib` -- a Gmail "app password" (not the real
+account password), not a paid transactional email service, keeping the
+project's $0 budget intact. `SMTP_USER`/`SMTP_PASS` are Lambda env vars; if
+they're unset, `send_daily_digest` logs a warning and returns instead of
+raising, same fail-open posture as the rest of the run -- a broken email
+integration should never take down the actual scoring/Sheet-writing work.
+It's also called *after* `completed_date` is already durably saved, so a
+digest failure (bad credentials, Gmail rate limit, network blip) can't
+roll back or block anything about the day's run being marked complete.
 
 ## Why postings are flushed and committed mid-run, not just at the end
 
