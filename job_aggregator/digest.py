@@ -11,10 +11,10 @@ service, consistent with the rest of this project's $0 budget. Requires a
 Gmail "app password" (not your real Gmail password) if using Gmail; set via
 SMTP_USER / SMTP_PASS env vars (Lambda environment variables in prod).
 
-No separate score threshold here on purpose -- it just emails whatever
-already got written_to_sheet=1 today, so the email always matches the
-Sheet (gated at profile.min_score in profiles.py). Tune min_score there
-and both the Sheet and the email move together.
+No separate score threshold here on purpose -- it reuses the profile's own
+min_score (profiles.py), the same number that gates the Sheet write.
+Don't filter on seen_postings.written_to_sheet instead -- nothing ever
+sets that column, so it's always 0.
 """
 
 import os
@@ -41,12 +41,12 @@ def send_daily_digest(conn, profiles, today):
         if not to_addr:
             continue
         try:
-            _send_one(conn, profile_id, to_addr, today)
+            _send_one(conn, profile_id, to_addr, today, profile.min_score)
         except Exception as e:
             print(f"WARNING: digest email failed for {profile_id}: {e}")
 
 
-def _send_one(conn, profile_id, to_addr, today):
+def _send_one(conn, profile_id, to_addr, today, min_score):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -54,10 +54,10 @@ def _send_one(conn, profile_id, to_addr, today):
             FROM seen_postings
             WHERE profile_id = %s
               AND first_seen_at::date = %s
-              AND written_to_sheet = 1
+              AND relevance_score >= %s - 0.0001
             ORDER BY relevance_score DESC
             """,
-            (profile_id, today),
+            (profile_id, today, min_score),
         )
         rows = cur.fetchall()
 
